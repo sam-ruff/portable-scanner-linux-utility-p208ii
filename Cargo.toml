@@ -2,9 +2,11 @@
 name = "p208ii"
 version = "0.1.0"
 edition = "2024"
+description = "Linux driver and receipt scanning app for the Canon imageFORMULA P-208II"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sam-ruff/portable-scanner-linux-utility-p208ii"
 
 [dependencies]
-anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 env_logger = "0.11.11"

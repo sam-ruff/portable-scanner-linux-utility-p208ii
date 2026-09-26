@@ -39,4 +39,8 @@ p208ii scan --continuous --smart-crop --format pdf
 cargo build --release
 ```
 
-The result is one binary that links only against the C library. The window uses the system's graphics drivers (Vulkan or OpenGL, through X11 or Wayland), which it loads at runtime. Set `RUST_LOG=debug` to see the commands sent to the scanner.
+The result is one binary that links only against the C library, libm and libgcc_s. The window uses the system's graphics drivers (Vulkan or OpenGL, through X11 or Wayland), which it loads at runtime. Set `RUST_LOG=debug` to see the commands sent to the scanner.
+
+## Licence
+
+Licensed under either the [MIT licence](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. Unless you say otherwise, any contribution you submit is dual licensed in the same way.

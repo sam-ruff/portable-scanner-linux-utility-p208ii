@@ -857,7 +857,7 @@ impl<T> Segment<T> {
     }
 }
 
-/// shadcn style tabs: a muted track with the chosen option raised.
+/// Tab-like choice: a muted track with the chosen option raised.
 fn segmented<'a, T: Copy + PartialEq + 'a>(
     segments: impl IntoIterator<Item = Segment<T>>,
     selected: T,

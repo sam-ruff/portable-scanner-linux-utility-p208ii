@@ -1,4 +1,4 @@
-//! Look and feel modelled on shadcn/ui's zinc theme, for light and dark mode.
+//! Neutral zinc palette and widget styles, for light and dark mode.
 
 use iced::border::Radius;
 use iced::widget::{button, container, scrollable, text_input, toggler};
