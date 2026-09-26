@@ -14,7 +14,7 @@ env:
 
 jobs:
   check:
-    runs-on: [self-hosted, linux]
+    runs-on: [self-hosted, sophie]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -38,7 +38,7 @@ jobs:
 
   build:
     needs: check
-    runs-on: [self-hosted, linux]
+    runs-on: [self-hosted, sophie]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
