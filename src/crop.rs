@@ -2,7 +2,7 @@
 //! measured at the left and right edges of the scan, and the receipt is the
 //! block of rows and columns where most pixels differ clearly from it.
 
-use crate::image::{Image, PixelFormat};
+use crate::image::{Image, PixelFormat, rgb_to_grey};
 
 /// How far from the backing level a pixel must be to count as receipt.
 const BACKING_TOLERANCE: u8 = 20;
@@ -21,11 +21,7 @@ pub struct CropBox {
 
 fn luminance(image: &Image) -> Vec<u8> {
     match image.format {
-        PixelFormat::Rgb8 => image
-            .data
-            .chunks_exact(3)
-            .map(|p| ((u16::from(p[0]) + u16::from(p[1]) + u16::from(p[2])) / 3) as u8)
-            .collect(),
+        PixelFormat::Rgb8 => rgb_to_grey(&image.data),
         PixelFormat::Grey8 | PixelFormat::BlackWhite => image.data.clone(),
     }
 }

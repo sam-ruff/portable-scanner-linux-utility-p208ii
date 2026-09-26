@@ -237,14 +237,19 @@ pub struct Image {
     pub data: Vec<u8>,
 }
 
+/// Averages packed RGB pixels into grey levels.
+pub fn rgb_to_grey(rgb: &[u8]) -> Vec<u8> {
+    let (pixels, _) = rgb.as_chunks::<3>();
+    pixels
+        .iter()
+        .map(|[r, g, b]| ((u16::from(*r) + u16::from(*g) + u16::from(*b)) / 3) as u8)
+        .collect()
+}
+
 fn to_grey(raw: &RawImage) -> Vec<u8> {
     match raw.mode {
         HwMode::Grey => raw.data.clone(),
-        HwMode::Colour => raw
-            .data
-            .chunks_exact(3)
-            .map(|p| ((u16::from(p[0]) + u16::from(p[1]) + u16::from(p[2])) / 3) as u8)
-            .collect(),
+        HwMode::Colour => rgb_to_grey(&raw.data),
     }
 }
 
