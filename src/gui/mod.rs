@@ -20,9 +20,11 @@ use log::{error, info};
 
 pub use logging::init as init_logging;
 
+use crate::ai::{self, CliReader, Job, Preferences, Provider, ProviderKind};
 use crate::encode::FileFormat;
+use crate::image::Image;
 use crate::params::{ColourMode, ScanSettings};
-use crate::session::{Backend, Command, Event, EventSink, SessionOptions, run_worker};
+use crate::session::{Backend, Command, Event, EventSink, SessionOptions, feed_paper, run_worker};
 
 const MAX_LOG_LINES: usize = 2000;
 const PAPER_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -69,6 +71,7 @@ enum Status {
     Preparing,
     Scanning,
     Stopping,
+    Feeding,
 }
 
 impl Status {
@@ -80,6 +83,7 @@ impl Status {
             Status::Preparing => "Calibrating",
             Status::Scanning => "Scanning",
             Status::Stopping => "Stopping",
+            Status::Feeding => "Feeding paper",
         }
     }
 
@@ -91,6 +95,7 @@ impl Status {
             Status::Preparing => "Calibrating takes a few seconds the first time.",
             Status::Scanning => "Keep the receipt straight while it feeds.",
             Status::Stopping => "Finishing the current receipt.",
+            Status::Feeding => "Moving paper through the scanner.",
         }
     }
 
@@ -98,7 +103,7 @@ impl Status {
         match self {
             Status::Idle => t.muted_foreground,
             Status::WaitingForPaper => t.success,
-            Status::Connecting | Status::Preparing | Status::Scanning => t.info,
+            Status::Connecting | Status::Preparing | Status::Scanning | Status::Feeding => t.info,
             Status::Stopping => t.muted_foreground,
         }
     }
@@ -112,6 +117,15 @@ pub enum Message {
     OpenFolder,
     Start,
     Stop,
+    FeedPaper,
+    PaperFed(Result<(), String>),
+    AiDiscovered(Vec<Provider>, Preferences),
+    AiEnabled(bool),
+    AiProviderSelected(ProviderKind),
+    AiFinished {
+        originals: Vec<PathBuf>,
+        result: Result<Vec<PathBuf>, String>,
+    },
     Worker(Event),
     Log(String),
     OpenSettings,
@@ -147,6 +161,14 @@ pub struct App {
     last_saved: Option<PathBuf>,
     /// Receipts saved by the session that just ended, for the summary line.
     finished_session: Option<usize>,
+    paper_fed: bool,
+    ai_preferences: Preferences,
+    ai_providers: Vec<Provider>,
+    ai_detecting: bool,
+    ai_queue: Option<mpsc::SyncSender<Job>>,
+    ai_pending: usize,
+    ai_status: Option<String>,
+    preferences_path: Option<PathBuf>,
     scanner_model: Option<String>,
     error: Option<String>,
 }
@@ -192,13 +214,21 @@ impl App {
             saved: 0,
             last_saved: None,
             finished_session: None,
+            paper_fed: false,
+            ai_preferences: Preferences::default(),
+            ai_providers: Vec::new(),
+            ai_detecting: true,
+            ai_queue: None,
+            ai_pending: 0,
+            ai_status: None,
+            preferences_path: None,
             scanner_model: None,
             error: None,
         }
     }
 
     fn is_running(&self) -> bool {
-        self.worker.is_some()
+        self.worker.is_some() || self.status == Status::Feeding
     }
 
     fn output_path(&self) -> PathBuf {
@@ -234,6 +264,50 @@ impl App {
             Message::OpenFolder => self.open_folder(),
             Message::Start => return self.start(),
             Message::Stop => self.stop(),
+            Message::FeedPaper => return self.feed(),
+            Message::PaperFed(result) => {
+                self.paper_fed = result.is_ok();
+                let error = result
+                    .err()
+                    .map(|err| format!("Could not feed paper: {err}"));
+                self.finish(error);
+            }
+            Message::AiDiscovered(providers, preferences) => {
+                self.ai_detecting = false;
+                self.ai_providers = providers;
+                self.ai_preferences = preferences;
+                if self.ai_preferences.provider.is_none() {
+                    self.ai_preferences.provider = self.ai_providers.first().map(|p| p.kind);
+                }
+            }
+            Message::AiEnabled(enabled) => {
+                self.ai_preferences.enabled = enabled;
+                self.save_preferences();
+            }
+            Message::AiProviderSelected(provider) => {
+                self.ai_preferences.provider = Some(provider);
+                self.save_preferences();
+            }
+            Message::AiFinished { originals, result } => {
+                self.ai_pending = self.ai_pending.saturating_sub(1);
+                match result {
+                    Ok(paths) => {
+                        if self
+                            .last_saved
+                            .as_ref()
+                            .is_some_and(|path| originals.contains(path))
+                        {
+                            self.last_saved = paths.first().cloned();
+                        }
+                        self.ai_status = Some("AI naming complete.".into());
+                    }
+                    Err(message) => {
+                        log::warn!("AI skipped: {message}. Original scans kept.");
+                        self.ai_status =
+                            Some(format!("AI skipped: {message}. Original scans kept."));
+                    }
+                }
+            }
             Message::Worker(event) => self.handle_event(event),
             Message::Log(line) => self.push_log(line),
             Message::OpenSettings => self.page = Page::Settings,
@@ -306,7 +380,33 @@ impl App {
         self.saved = 0;
         self.last_saved = None;
         self.finished_session = None;
+        self.paper_fed = false;
         Task::run(event_rx, Message::Worker)
+    }
+
+    fn feed(&mut self) -> Task<Message> {
+        if self.is_running() {
+            return Task::none();
+        }
+
+        let (result_tx, result_rx) = unbounded();
+        let backend = self.backend.clone();
+        let spawned = std::thread::Builder::new()
+            .name("paper-feed".into())
+            .spawn(move || {
+                let result = feed_paper(&backend).map_err(|err| err.to_string());
+                let _ = result_tx.unbounded_send(result);
+            });
+        if let Err(err) = spawned {
+            self.error = Some(format!("Could not start paper feed: {err}"));
+            return Task::none();
+        }
+
+        self.status = Status::Feeding;
+        self.error = None;
+        self.paper_fed = false;
+        self.finished_session = None;
+        Task::run(result_rx, Message::PaperFed)
     }
 
     fn stop(&mut self) {
@@ -334,9 +434,10 @@ impl App {
             Event::Preparing if self.status != Status::Stopping => self.status = Status::Preparing,
             Event::Scanning if self.status != Status::Stopping => self.status = Status::Scanning,
             Event::WaitingForPaper | Event::Preparing | Event::Scanning => {}
-            Event::Saved { paths } => {
+            Event::Saved { paths, images } => {
                 self.saved += 1;
-                self.last_saved = paths.into_iter().next();
+                self.last_saved = paths.first().cloned();
+                self.queue_ai(paths, images);
             }
             Event::Finished { saved } => {
                 self.finished_session = Some(saved);
@@ -350,6 +451,88 @@ impl App {
         self.worker = None;
         self.status = Status::Idle;
         self.error = error;
+    }
+
+    fn save_preferences(&mut self) {
+        if let Some(path) = &self.preferences_path
+            && let Err(err) = self.ai_preferences.save(path)
+        {
+            self.ai_status = Some(format!("Could not save AI preference: {err}"));
+        }
+    }
+
+    fn queue_ai(&mut self, paths: Vec<PathBuf>, images: Vec<Image>) {
+        if !self.ai_preferences.enabled {
+            return;
+        }
+        let provider = self
+            .ai_providers
+            .iter()
+            .find(|provider| Some(provider.kind) == self.ai_preferences.provider)
+            .cloned();
+        let Some(provider) = provider else {
+            self.ai_status = Some("Selected AI tool is unavailable. Original scans kept.".into());
+            return;
+        };
+        let Some(queue) = &self.ai_queue else {
+            self.ai_status = Some("AI worker is unavailable. Original scans kept.".into());
+            return;
+        };
+        let job = match Job::new(provider, images, self.format, paths) {
+            Ok(job) => job,
+            Err(err) => {
+                self.ai_status = Some(format!("AI skipped: {err}. Original scans kept."));
+                return;
+            }
+        };
+        if queue.try_send(job).is_err() {
+            self.ai_status = Some("AI is busy. Original scans kept for this receipt.".into());
+            return;
+        }
+        self.ai_pending += 1;
+        self.ai_status = None;
+    }
+
+    fn background_tasks(&mut self) -> Task<Message> {
+        self.preferences_path = Preferences::path();
+        let (discovery_tx, discovery_rx) = unbounded();
+        if std::thread::Builder::new()
+            .name("ai-discovery".into())
+            .spawn(move || {
+                let _ = discovery_tx.unbounded_send((ai::discover(), Preferences::load()));
+            })
+            .is_err()
+        {
+            self.ai_detecting = false;
+        }
+        let (job_tx, job_rx) = mpsc::sync_channel::<Job>(1);
+        let (result_tx, result_rx) = unbounded();
+        let worker = std::thread::Builder::new()
+            .name("receipt-ai".into())
+            .spawn(move || {
+                for job in job_rx {
+                    let reader = CliReader {
+                        provider: job.provider.clone(),
+                    };
+                    let originals = job.paths();
+                    let result = ai::process(&job, &reader);
+                    if result_tx
+                        .unbounded_send(Message::AiFinished { originals, result })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        if worker.is_ok() {
+            self.ai_queue = Some(job_tx);
+        }
+        Task::batch([
+            Task::run(discovery_rx, |(providers, prefs)| {
+                Message::AiDiscovered(providers, prefs)
+            }),
+            Task::run(result_rx, |message| message),
+        ])
     }
 
     fn push_log(&mut self, line: String) {
@@ -424,7 +607,7 @@ impl App {
             page = page.push(error_alert(message));
         }
         page = page
-            .push(self.session_card())
+            .push(self.session_card(compact))
             .push(self.destination_card(compact));
         if self.advanced {
             page = page.push(self.log_card());
@@ -444,6 +627,7 @@ impl App {
             header,
             self.settings_card(),
             self.output_card(),
+            self.ai_card(),
             self.advanced_card()
         ]
     }
@@ -465,7 +649,60 @@ impl App {
         )
     }
 
-    fn session_card(&self) -> Element<'_, Message> {
+    fn ai_card(&self) -> Element<'_, Message> {
+        let available = !self.ai_providers.is_empty();
+        let description = if self.ai_detecting {
+            "Looking for Claude and Codex..."
+        } else if !available {
+            "Claude or Codex was not found. Scanning works normally."
+        } else {
+            "Name receipts from their contents and remove confirmed blank sides."
+        };
+        let toggle = toggler(self.ai_preferences.enabled)
+            .size(20)
+            .style(style::switch)
+            .on_toggle_maybe((available && !self.ai_detecting).then_some(Message::AiEnabled));
+        let mut rows = column![setting_row(
+            "AI receipt naming",
+            description,
+            toggle.into(),
+            false
+        ),]
+        .spacing(16);
+        if available {
+            let providers = self.ai_providers.iter().map(|provider| {
+                Segment::new(
+                    provider.kind,
+                    match provider.kind {
+                        ProviderKind::Codex => "Codex",
+                        ProviderKind::Claude => "Claude",
+                    },
+                    "Use this tool's existing login and model settings.",
+                )
+            });
+            let selected = self
+                .ai_preferences
+                .provider
+                .unwrap_or(self.ai_providers[0].kind);
+            rows = rows.push(segmented(
+                providers,
+                selected,
+                false,
+                Message::AiProviderSelected,
+            ));
+            rows = rows.push(
+                text(
+                    "When enabled, receipt images are sent through the selected AI tool. \
+                 Scanning continues if it is busy, unavailable or unsure.",
+                )
+                .size(13)
+                .style(style::muted_text),
+            );
+        }
+        titled_card("AI assistance", None, rows)
+    }
+
+    fn session_card(&self, compact: bool) -> Element<'_, Message> {
         let running = self.is_running();
         let status = self.status;
         let heading = row![
@@ -518,7 +755,29 @@ impl App {
             body = body.push(text(summary).size(14).style(style::success_text));
         }
 
+        if self.paper_fed {
+            body = body.push(
+                text("Paper feed complete.")
+                    .size(14)
+                    .style(style::success_text),
+            );
+        }
+        if self.ai_pending > 0 {
+            body = body.push(
+                text(format!(
+                    "AI is naming {} receipt(s) in the background.",
+                    self.ai_pending
+                ))
+                .size(13)
+                .style(style::muted_text),
+            );
+        }
+        if let Some(message) = &self.ai_status {
+            body = body.push(text(message).size(13).style(style::muted_text));
+        }
+
         let action = match (running, status) {
+            (true, Status::Feeding) => action_button("Start scanning", None, style::primary, None),
             (true, Status::Stopping) => action_button("Stopping", None, style::outline, None),
             (true, _) => action_button(
                 "Stop scanning",
@@ -534,7 +793,31 @@ impl App {
             ),
         };
 
-        card(column![body, action].spacing(20))
+        let feed = with_tip(
+            action_button(
+                if status == Status::Feeding {
+                    "Feeding..."
+                } else {
+                    "Feed paper"
+                },
+                None,
+                style::outline,
+                (!running).then_some(Message::FeedPaper),
+            ),
+            if running {
+                "Wait until scanning or feeding has finished."
+            } else {
+                "Feed one detected sheet without scanning. Cannot force the rollers during a jam."
+            },
+            tooltip::Position::Bottom,
+        );
+        let actions: Element<'_, Message> = if compact {
+            column![action, feed].spacing(8).into()
+        } else {
+            row![action, feed].spacing(8).into()
+        };
+
+        card(column![body, actions].spacing(20))
     }
 
     fn destination_card(&self, compact: bool) -> Element<'_, Message> {
@@ -1003,7 +1286,7 @@ fn error_alert(message: &str) -> Element<'_, Message> {
     container(
         row![
             column![
-                text("Couldn't scan")
+                text("Couldn't complete action")
                     .size(14)
                     .font(SEMIBOLD)
                     .style(style::destructive_text),
@@ -1027,11 +1310,12 @@ pub fn run(backend: Backend, output_dir: PathBuf, logs: UnboundedReceiver<String
     let logs = Cell::new(Some(logs));
     iced::application(
         move || {
-            let app = App::new(backend.clone(), output_dir.clone());
+            let mut app = App::new(backend.clone(), output_dir.clone());
+            let background = app.background_tasks();
             let task = logs
                 .take()
                 .map_or_else(Task::none, |logs| Task::run(logs, Message::Log));
-            (app, task)
+            (app, Task::batch([task, background]))
         },
         App::update,
         App::view,
@@ -1089,6 +1373,7 @@ mod tests {
 
         let _ = app.update(Message::Worker(Event::Saved {
             paths: vec![dir.path().join("scan-0001.png")],
+            images: Vec::new(),
         }));
         assert_eq!(app.saved, 1);
 
@@ -1122,6 +1407,95 @@ mod tests {
         app.worker = Some(tx);
         let _ = app.update(Message::Stop);
         assert!(!app.is_running());
+    }
+
+    #[test]
+    fn feeding_needs_no_folder_and_preserves_saved_receipts() {
+        let mut app = app();
+        app.output_dir.clear();
+        app.saved = 2;
+        app.last_saved = Some(PathBuf::from("scan-0002.png"));
+        app.error = Some("no paper in the feeder".into());
+
+        let _ = app.update(Message::FeedPaper);
+        assert_eq!(app.status, Status::Feeding);
+        assert!(app.is_running());
+        assert!(app.error.is_none());
+
+        let _ = app.update(Message::Start);
+        let _ = app.update(Message::FeedPaper);
+        assert_eq!(app.status, Status::Feeding);
+        assert!(app.worker.is_none());
+
+        let _ = app.update(Message::PaperFed(Ok(())));
+        assert!(!app.is_running());
+        assert!(app.paper_fed);
+        assert_eq!(app.saved, 2);
+        assert_eq!(app.last_saved, Some(PathBuf::from("scan-0002.png")));
+    }
+
+    #[test]
+    fn feeding_is_blocked_while_scanning() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        app.worker = Some(tx);
+        app.status = Status::Scanning;
+
+        let _ = app.update(Message::FeedPaper);
+        assert_eq!(app.status, Status::Scanning);
+    }
+
+    #[test]
+    fn feed_failure_is_reported_and_allows_retry() {
+        let mut app = app();
+        app.status = Status::Feeding;
+
+        let _ = app.update(Message::PaperFed(Err("scanner was disconnected".into())));
+        assert!(!app.is_running());
+        assert!(!app.paper_fed);
+        assert_eq!(
+            app.error.as_deref(),
+            Some("Could not feed paper: scanner was disconnected")
+        );
+
+        let _ = app.update(Message::FeedPaper);
+        assert_eq!(app.status, Status::Feeding);
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn ai_failure_does_not_stop_scanning_or_change_the_latest_file() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        app.worker = Some(tx);
+        app.status = Status::WaitingForPaper;
+        app.ai_pending = 1;
+        app.last_saved = Some(PathBuf::from("scan-0002.png"));
+        let _ = app.update(Message::AiFinished {
+            originals: vec![PathBuf::from("scan-0001.png")],
+            result: Err("usage limit reached".into()),
+        });
+        assert!(app.is_running());
+        assert_eq!(app.status, Status::WaitingForPaper);
+        assert!(app.error.is_none());
+        assert_eq!(app.ai_pending, 0);
+        assert_eq!(app.last_saved, Some(PathBuf::from("scan-0002.png")));
+    }
+
+    #[test]
+    fn ai_result_only_updates_its_own_latest_file() {
+        let mut app = app();
+        app.last_saved = Some(PathBuf::from("scan-0002.png"));
+        let _ = app.update(Message::AiFinished {
+            originals: vec![PathBuf::from("scan-0001.png")],
+            result: Ok(vec![PathBuf::from("first-receipt.png")]),
+        });
+        assert_eq!(app.last_saved, Some(PathBuf::from("scan-0002.png")));
+        let _ = app.update(Message::AiFinished {
+            originals: vec![PathBuf::from("scan-0002.png")],
+            result: Ok(vec![PathBuf::from("second-receipt.png")]),
+        });
+        assert_eq!(app.last_saved, Some(PathBuf::from("second-receipt.png")));
     }
 
     #[test]

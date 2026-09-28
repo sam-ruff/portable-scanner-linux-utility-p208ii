@@ -213,12 +213,19 @@ impl<C: ScsiChannel> Scanner<C> {
             .map(drop)
     }
 
+    /// Takes hold of a sheet, then moves it out without scanning.
+    pub fn feed_paper(&self) -> Result<(), ScanError> {
+        self.feed()?;
+        self.eject()
+    }
+
     fn feed(&self) -> Result<(), ScanError> {
         self.exec(Request::new(cdb::object_position(true)))
             .map(drop)
     }
 
-    fn eject(&self) -> Result<(), ScanError> {
+    /// Runs the paper discharge operation without scanning or checking the feeder sensor.
+    pub fn eject(&self) -> Result<(), ScanError> {
         self.exec(Request::new(cdb::object_position(false)))
             .map(drop)
     }
@@ -647,6 +654,84 @@ mod tests {
             assert_eq!(batch.next_page(), Ok(None));
         }
         assert!(!scanner.channel.was_cancelled());
+    }
+
+    #[test]
+    fn manual_feed_reports_firmware_paper_errors_without_claiming_success() {
+        for loaded in [true, false] {
+            let simulator = SimulatedScanner::new(PaperSupply::Sheets(0), Duration::ZERO);
+            let mut channel = MockScsiChannel::new();
+            channel
+                .expect_execute()
+                .returning(move |request| simulator.execute(request));
+            let mut scanner = Scanner::open(channel).expect("scanner opens");
+            scanner.channel.checkpoint();
+            let mut sequence = mockall::Sequence::new();
+            scanner
+                .channel
+                .expect_execute()
+                .withf(|request| request.cdb == cdb::object_position(true))
+                .times(1)
+                .in_sequence(&mut sequence)
+                .return_once(move |_| {
+                    if loaded {
+                        Ok(Reply::default())
+                    } else {
+                        Err(ScanError::NoDocuments)
+                    }
+                });
+            if loaded {
+                scanner
+                    .channel
+                    .expect_execute()
+                    .withf(|request| request.cdb == cdb::object_position(false))
+                    .times(1)
+                    .in_sequence(&mut sequence)
+                    .returning(|_| Ok(Reply::default()));
+            }
+            assert_eq!(
+                scanner.feed_paper(),
+                if loaded {
+                    Ok(())
+                } else {
+                    Err(ScanError::NoDocuments)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn manual_eject_only_discharges_paper_and_preserves_errors() {
+        for outcome in [
+            Ok(Reply::default()),
+            Err(ScanError::Jammed("paper jam")),
+            Err(ScanError::NoDocuments),
+            Err(ScanError::Transport(
+                crate::error::TransportError::Disconnected,
+            )),
+        ] {
+            let simulator = SimulatedScanner::new(PaperSupply::Sheets(0), Duration::ZERO);
+            let mut channel = MockScsiChannel::new();
+            channel
+                .expect_execute()
+                .returning(move |request| simulator.execute(request));
+            let mut scanner = Scanner::open(channel).expect("scanner opens");
+            scanner.channel.checkpoint();
+
+            let expected = outcome.clone().map(drop);
+            scanner
+                .channel
+                .expect_execute()
+                .withf(|request| {
+                    request.cdb == cdb::object_position(false)
+                        && request.read_len == 0
+                        && request.data_out.is_none()
+                })
+                .times(1)
+                .return_once(move |_| outcome);
+
+            assert_eq!(scanner.eject(), expected);
+        }
     }
 
     #[test]

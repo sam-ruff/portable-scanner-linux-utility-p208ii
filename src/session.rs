@@ -11,6 +11,7 @@ use crate::channel::{ScsiChannel, UsbScsiChannel};
 use crate::crop::smart_crop;
 use crate::encode::FileFormat;
 use crate::error::ScanError;
+use crate::image::Image;
 use crate::output::ScanFolder;
 use crate::params::ScanSettings;
 use crate::scanner::Scanner;
@@ -26,13 +27,23 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    Connected { model: String, firmware: String },
+    Connected {
+        model: String,
+        firmware: String,
+    },
     WaitingForPaper,
     Preparing,
     Scanning,
-    Saved { paths: Vec<PathBuf> },
-    Finished { saved: usize },
-    Failed { message: String },
+    Saved {
+        paths: Vec<PathBuf>,
+        images: Vec<Image>,
+    },
+    Finished {
+        saved: usize,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 pub trait EventSink {
@@ -68,18 +79,27 @@ pub enum Backend {
 
 pub fn open_scanner(backend: &Backend) -> Result<Scanner<Box<dyn ScsiChannel>>, ScanError> {
     let channel: Box<dyn ScsiChannel> = match backend {
-        Backend::Usb => {
-            let found = find_scanner()?;
-            info!("Found {} on {}", found.model, found.location());
-            let transport = NusbTransport::open(&found)?;
-            Box::new(UsbScsiChannel::new(transport, USB_RECOVERY_DELAY))
-        }
+        Backend::Usb => Box::new(open_usb_channel()?),
         Backend::Simulated { supply, read_delay } => {
             info!("Using the simulated scanner");
             Box::new(SimulatedScanner::new(*supply, *read_delay))
         }
     };
     Scanner::open(channel)
+}
+
+pub fn open_usb_channel() -> Result<UsbScsiChannel<NusbTransport>, ScanError> {
+    let found = find_scanner()?;
+    let transport = NusbTransport::open(&found)?;
+    Ok(UsbScsiChannel::new(transport, USB_RECOVERY_DELAY))
+}
+
+pub fn feed_paper(backend: &Backend) -> Result<(), ScanError> {
+    let scanner = open_scanner(backend)?;
+    info!("Feeding paper through without scanning");
+    scanner.feed_paper()?;
+    info!("Paper feed complete");
+    Ok(())
 }
 
 fn stop_requested(commands: &Receiver<Command>) -> bool {
@@ -164,7 +184,7 @@ pub fn run_session(
                 .collect();
             info!("Saved {}", names.join(" and "));
             saved += 1;
-            events.emit(Event::Saved { paths });
+            events.emit(Event::Saved { paths, images });
         }
         let scanned = batch.pages();
         drop(batch);
@@ -266,7 +286,7 @@ mod tests {
         let saved: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                Event::Saved { paths } => Some(paths[0].clone()),
+                Event::Saved { paths, .. } => Some(paths[0].clone()),
                 _ => None,
             })
             .collect();
@@ -302,7 +322,7 @@ mod tests {
         let path = collect(&event_rx)
             .into_iter()
             .find_map(|e| match e {
-                Event::Saved { paths } => paths.into_iter().next(),
+                Event::Saved { paths, .. } => paths.into_iter().next(),
                 _ => None,
             })
             .expect("a scan was saved");

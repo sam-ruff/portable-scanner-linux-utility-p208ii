@@ -1,0 +1,14 @@
+[Unit]
+Description=Canon P-208II scanner button listener
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart="%h/.local/bin/p208ii" watch-button
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=p208ii=info
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target

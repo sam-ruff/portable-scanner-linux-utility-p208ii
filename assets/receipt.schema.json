@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["merchant", "date", "total", "currency", "confidence", "blank_sides"],
+  "properties": {
+    "merchant": { "type": "string" },
+    "date": { "type": ["string", "null"] },
+    "total": { "type": ["string", "null"] },
+    "currency": { "type": ["string", "null"] },
+    "confidence": { "type": "number" },
+    "blank_sides": { "type": "array", "items": { "type": "boolean" } }
+  }
+}

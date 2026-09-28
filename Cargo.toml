@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/sam-ruff/portable-scanner-linux-utility-p208ii"
 
 [dependencies]
+base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
 env_logger = "0.11.11"
@@ -17,6 +18,9 @@ miniz_oxide = "0.9.1"
 nusb = "0.2.7"
 png = "0.18.1"
 rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tempfile = "3.27.0"
 thiserror = "2.0.21"
 
 [profile.release]
@@ -25,4 +29,3 @@ lto = "thin"
 
 [dev-dependencies]
 mockall = "0.15.0"
-tempfile = "3.27.0"

@@ -6,11 +6,11 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use p208ii::encode::FileFormat;
-use p208ii::gui;
 use p208ii::output::default_output_dir;
 use p208ii::params::{ColourMode, ScanSettings};
 use p208ii::session::{Backend, Event, SessionOptions, open_scanner, run_worker};
 use p208ii::simulator::PaperSupply;
+use p208ii::{button, gui, install};
 
 /// Scans receipts with a Canon imageFORMULA P-208II. Opens the app when run
 /// without a command.
@@ -31,6 +31,12 @@ enum CliCommand {
     Scan(ScanArgs),
     /// Show scanner details and usage counters
     Info,
+    /// Install the app and enable the scanner's blue button for this user
+    Install,
+    /// Remove the installed app and button listener, keeping scans
+    Uninstall,
+    /// Listen for the scanner's blue button (normally started at login)
+    WatchButton,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -135,7 +141,7 @@ fn scan(args: ScanArgs, backend: Backend) -> ExitCode {
     for event in event_rx {
         match event {
             Event::WaitingForPaper => eprintln!("Insert a receipt to scan"),
-            Event::Saved { paths } => {
+            Event::Saved { paths, .. } => {
                 for path in paths {
                     println!("{}", path.display());
                 }
@@ -193,11 +199,30 @@ fn main() -> ExitCode {
             env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
                 .init();
             match command {
+                CliCommand::Install => return command_result(install::install()),
+                CliCommand::Uninstall => return command_result(install::uninstall()),
+                CliCommand::WatchButton => return command_result(button::watch()),
+                _ => {}
+            }
+            let _lock = if cli.simulate {
+                None
+            } else {
+                match button::lock_application() {
+                    Ok(lock) => Some(lock),
+                    Err(err) => return command_result(Err(err)),
+                }
+            };
+            match command {
                 CliCommand::Scan(args) => scan(args, backend(cli.simulate, PaperSupply::Sheets(3))),
                 CliCommand::Info => info(backend(cli.simulate, PaperSupply::Sheets(0))),
+                _ => ExitCode::SUCCESS,
             }
         }
         None => {
+            let _lock = match button::lock_application() {
+                Ok(lock) => lock,
+                Err(err) => return command_result(Err(err)),
+            };
             let logs = gui::init_logging();
             let backend = backend(cli.simulate, PaperSupply::Every(Duration::from_secs(4)));
             match gui::run(backend, default_output_dir(), logs) {
@@ -207,6 +232,16 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+    }
+}
+
+fn command_result(result: Result<(), p208ii::error::ScanError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            ExitCode::FAILURE
         }
     }
 }
